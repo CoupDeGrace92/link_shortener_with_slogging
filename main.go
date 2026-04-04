@@ -14,6 +14,7 @@ import (
 
 	pkgerr "github.com/pkg/errors"
 
+	build "boot.dev/linko/internal/build"
 	"boot.dev/linko/internal/linkoerr"
 	"boot.dev/linko/internal/store"
 )
@@ -37,6 +38,16 @@ func main() {
 		slog.Error(fmt.Sprintf("Logger failed to initialize: %d", err))
 		os.Exit(1)
 	}
+	host, err := os.Hostname()
+	if err != nil {
+		logger.Error("failed to get hostname", "message", err)
+	}
+	logger = logger.With(
+		slog.String("git_sha", build.GitSHA),
+		slog.String("build_time", build.BuildTime),
+		slog.String("env", os.Getenv("ENV")),
+		slog.String("hostname", host),
+	)
 
 	httpPort := flag.Int("port", 8899, "port to listen on")
 	dataDir := flag.String("data", "./data", "directory to store data")
