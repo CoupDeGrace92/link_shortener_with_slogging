@@ -2,14 +2,19 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"boot.dev/linko/internal/store"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type server struct {
@@ -19,16 +24,111 @@ type server struct {
 	logger     *slog.Logger
 }
 
+type spyReadCloser struct {
+	io.ReadCloser
+	bytesRead int
+}
+
+func (r *spyReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.bytesRead += n
+	return n, err
+}
+
+type spyResponseWriter struct {
+	http.ResponseWriter
+	bytesWritten int
+	statusCode   int
+}
+
+func (w *spyResponseWriter) Write(p []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytesWritten += n
+	return n, err
+}
+
+func (w *spyResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+const logContextKey contextKey = "log_context"
+
+type LogContext struct {
+	Username string
+	Error    error
+}
+
+func httpError(ctx context.Context, w http.ResponseWriter, status int, err error) {
+	if logCtx, ok := ctx.Value(logContextKey).(*LogContext); ok {
+		logCtx.Error = err
+	}
+	if status == 401 || status == 403 || status == 500 {
+		http.Error(w, http.StatusText(status), status)
+	} else {
+		http.Error(w, err.Error(), status)
+	}
+}
+
+func IDChecker() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ID := r.Header.Get("X-Request-ID")
+			if ID == "" {
+				ID = rand.Text()
+			}
+			w.Header().Set("X-Request-ID", ID)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func redactIP(ip string) string {
+	host, _, err := net.SplitHostPort(ip)
+	if err != nil {
+		host = ip
+	}
+	parsedIP := net.ParseIP(host)
+	if parsedIP == nil {
+		return host
+	}
+	ip4 := parsedIP.To4()
+	if ip4 == nil {
+		return host
+	}
+	return fmt.Sprintf("%d.%d.%d.x", ip4[0], ip4[1], ip4[2])
+}
+
 func requestLogger(l *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			next.ServeHTTP(w, r)
-			l.Info(
-				"Served request",
+			start := time.Now()
+			spyReader := &spyReadCloser{ReadCloser: r.Body}
+			r.Body = spyReader
+			spyWriter := &spyResponseWriter{ResponseWriter: w}
+			contextLog := &LogContext{}
+			rContext := r.WithContext(context.WithValue(r.Context(), logContextKey, contextLog))
+			next.ServeHTTP(spyWriter, rContext)
+			attrs := []any{
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
-				slog.String("client_ip", r.RemoteAddr),
-			)
+				slog.String("client_ip", redactIP(r.RemoteAddr)),
+				slog.Duration("duration", time.Since(start)),
+				slog.Int("request_body_bytes", spyReader.bytesRead),
+				slog.Int("response_status", spyWriter.statusCode),
+				slog.Int("response_body_bytes", spyWriter.bytesWritten),
+				slog.String("request_id", w.Header().Get("X-Request-ID")),
+			}
+			if contextLog.Username != "" {
+				attrs = append(attrs, slog.String("user", contextLog.Username))
+			}
+			if contextLog.Error != nil {
+				attrs = append(attrs, slog.Any("error", contextLog.Error))
+			}
+			l.Info("Served request", attrs...)
 		})
 	}
 }
@@ -39,7 +139,7 @@ func newServer(store store.Store, port int, cancel context.CancelFunc, l *slog.L
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
-		Handler: requestLogger(l)(mux),
+		Handler: IDChecker()(requestLogger(l)(mux)),
 	}
 
 	s := &server{
@@ -59,6 +159,7 @@ func newServer(store store.Store, port int, cancel context.CancelFunc, l *slog.L
 	mux.Handle("GET /api/urls", s.authMiddleware(http.HandlerFunc(s.handlerListURLs)))
 	mux.HandleFunc("GET /{shortCode}", s.handlerRedirect)
 	mux.HandleFunc("POST /admin/shutdown", s.handlerShutdown)
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	return s
 }

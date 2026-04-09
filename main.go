@@ -1,18 +1,22 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/lmittmann/tint"
+	"github.com/mattn/go-isatty"
 	pkgerr "github.com/pkg/errors"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 
 	build "boot.dev/linko/internal/build"
 	"boot.dev/linko/internal/linkoerr"
@@ -88,40 +92,46 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 
 func initializeLogger() (*slog.Logger, func(), error) {
 	closeFunc := func() {}
-	handlers := []slog.Handler{slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	nocolor := true
+	if isatty.IsCygwinTerminal(os.Stderr.Fd()) || isatty.IsTerminal(os.Stderr.Fd()) {
+		nocolor = false
+	}
+
+	handlers := []slog.Handler{tint.NewHandler(os.Stderr, &tint.Options{
 		Level:       slog.LevelDebug,
 		ReplaceAttr: replaceAttr,
+		NoColor:     nocolor,
 	})}
 
 	f := os.Getenv("LINKO_LOG_FILE")
 	if f != "" {
-		file, err := os.OpenFile(f, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return nil, closeFunc, err
+		logger := &lumberjack.Logger{
+			Filename:   f,
+			MaxSize:    1,
+			MaxAge:     28,
+			MaxBackups: 10,
+			LocalTime:  false,
+			Compress:   true,
 		}
-		bufferedFile := bufio.NewWriterSize(file, 8192)
-		infoHandler := slog.NewJSONHandler(bufferedFile, &slog.HandlerOptions{
-			Level:       slog.LevelInfo,
-			ReplaceAttr: replaceAttr,
-		})
-		handlers = append(handlers, infoHandler)
 		closeFunc = func() {
-			err = bufferedFile.Flush()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to flush buffered log file: %v\n", err)
-			}
-			file.Close()
+			logger.Close()
 		}
+		handlers = append(handlers, slog.NewJSONHandler(logger, &slog.HandlerOptions{
+			ReplaceAttr: replaceAttr,
+		}))
 	}
-	logger := slog.New(slog.NewMultiHandler(
+
+	l := slog.New(slog.NewMultiHandler(
 		handlers...,
 	))
 
-	return logger, closeFunc, nil
+	return l, closeFunc, nil
 }
 
 func replaceAttr(groups []string, a slog.Attr) slog.Attr {
-	if a.Key == "error" {
+	a = checkSensitive(groups, a)
+	k := a.Key
+	if k == "error" {
 		err, ok := a.Value.Any().(error)
 		if ok {
 			if multiError, ok := errors.AsType[multiError](err); ok {
@@ -133,6 +143,36 @@ func replaceAttr(groups []string, a slog.Attr) slog.Attr {
 			}
 			attrs := errAttrs(err)
 			return slog.GroupAttrs("error", attrs...)
+		}
+	}
+	return a
+}
+
+var sensitive = map[string](struct{}){
+	"password":     struct{}{},
+	"key":          struct{}{},
+	"apikey":       struct{}{},
+	"secret":       struct{}{},
+	"pin":          struct{}{},
+	"creditcardno": struct{}{},
+	"user":         struct{}{},
+}
+
+func checkSensitive(groups []string, a slog.Attr) slog.Attr {
+	k := a.Key
+	_, ok := sensitive[k]
+	if ok {
+		a = slog.String(a.Key, "[REDACTED]")
+	}
+	u := a.Value
+	parsed, err := url.Parse(u.String())
+	if err != nil {
+		return a
+	}
+	if parsed.User != nil {
+		if _, set := parsed.User.Password(); set {
+			parsed.User = url.UserPassword(parsed.User.Username(), "[REDACTED]")
+			a = slog.String(a.Key, parsed.String())
 		}
 	}
 	return a
