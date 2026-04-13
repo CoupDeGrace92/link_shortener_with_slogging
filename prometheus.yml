@@ -10,4 +10,4 @@ scrape_configs:
       - targets: ["node-exporter:9100"]
   - job_name: linko
     static_configs:
-      - targets: ["host.docker.internal:8899"]
+      - targets: ["172.19.56.227:8899"]

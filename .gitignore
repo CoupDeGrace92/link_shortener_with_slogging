@@ -3,3 +3,8 @@ linko
 *~
 vendor/
 *.log
+*.gz
+*.txt
+*.prof
+*.pprof.*
+*.svg

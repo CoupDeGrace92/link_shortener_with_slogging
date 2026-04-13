@@ -6,15 +6,19 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/lmittmann/tint"
 	"github.com/mattn/go-isatty"
 	pkgerr "github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 
@@ -33,15 +37,26 @@ type multiError interface {
 	Unwrap() []error
 }
 
+var httpRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{Name: "http_requests_total"}, []string{"method", "path", "status"})
+
 func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+	traceShutdown, err := initTracing(ctx)
+	if err != nil {
+		slog.Error(fmt.Sprintf("Trace failed to initializeL %d", err))
+		os.Exit(1)
+	}
+	defer traceShutdown(context.Background())
 
 	logger, cleanup, err := initializeLogger()
 	if err != nil {
 		slog.Error(fmt.Sprintf("Logger failed to initialize: %d", err))
 		os.Exit(1)
 	}
+	defer cleanup()
+
 	host, err := os.Hostname()
 	if err != nil {
 		logger.Error("failed to get hostname", "message", err)
@@ -59,7 +74,6 @@ func main() {
 
 	status := run(ctx, cancel, *httpPort, *dataDir, logger)
 	cancel()
-	cleanup()
 	os.Exit(status)
 }
 
@@ -191,4 +205,31 @@ func errAttrs(err error) []slog.Attr {
 	}
 	attrs = append(attrs, linkoerr.Attrs(err)...)
 	return attrs
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+		}
+
+		next.ServeHTTP(rec, r)
+
+		path := r.URL.Path
+		method := r.Method
+		status := strconv.Itoa(rec.status)
+
+		httpRequestsTotal.WithLabelValues(method, path, status).Inc()
+	})
 }
